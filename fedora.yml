@@ -1,0 +1,78 @@
+---
+- hosts: $target
+  sudo: yes
+  tasks:
+    - name: Install necessary packages
+      action: yum state=present name=$item
+      with_items:
+      - httpd
+      - ruby
+      - rubygems
+      - rubygem-bundler
+      - ruby-devel
+      - git
+      - python-pygments
+      - perl-Data-Dumper
+      - postfix
+      - redis
+      - libicu-devel
+      - libxslt-devel
+      - libxml2-devel
+
+    - name: Create user 'git'
+      user: state=present name=git system=yes shell=/bin/sh comment="Git Version Control"
+
+    - name: Create user 'gitlab'
+      user: state=present name=gitlab groups=git comment="GitLab" generate_ssh_key=yes
+
+- hosts: $target
+  sudo: yes
+  sudo_user: git
+  tasks:
+    - name: Clone the gitlab fork of gitolite
+      git: repo=https://github.com/gitlabhq/gitolite.git dest=/home/git/gitolite version=gl-v320
+
+    - name: ensure /home/git/bin exists
+      file: state=directory path=/home/git/bin
+      # It’s not ideal to solve this using handlers, but we don’t want that append script to trigger twice – and it’s not possible to check if it has run without doing anything crazy.
+      notify:
+        - Setup gitolite PATH
+        - Setup gitolite symlink
+
+  handlers:
+    - name: Setup gitolite PATH
+      command: sh -c 'printf "%b\n%b\n" "PATH=\$PATH:/home/git/bin" "export PATH" >> /home/git/.profile'
+
+    - name: Setup gitolite symlink
+      command: sh -c 'gitolite/install -ln /home/git/bin' chdir=/home/git
+
+- hosts: $target
+  sudo: yes
+  tasks:
+    - name: Copy the 'gitlab' user SSH key to the 'git' user home directory
+      command: cp /home/gitlab/.ssh/id_rsa.pub /home/git/gitlab.pub creates=/home/git/gitlab.pub
+
+    - name: Set permissions on the copied SSH key
+      file: path=/home/git/gitlab.pub mode=0444
+
+- hosts: $target
+  sudo: yes
+  sudo_user: git
+  tasks:
+    - name: Run gitolite setup (creates gitolite-admin repo)
+      command: sh -c "PATH=/home/git/bin:$PATH; gitolite setup -pk /home/git/gitlab.pub" creates=/home/git/repositories/gitolite-admin.git
+
+- hosts: $target
+  sudo: yes
+  tasks:
+    - name: Ensure Gitolite config dir is owned by git:git and has mode 750
+      file: state=directory path=/home/git/.gitolite mode=750 owner=git group=git recurse=yes
+
+    - name: Fix directory permissions for repositories (1)
+      command: sudo chmod -R ug+rwX,o-rwx /home/git/repositories/
+
+    - name: fix directory permissions for repositories (2)
+      file: state=directory path=/home/git/repositories owner=git group=git recurse=yes
+
+    - name: fix directory permissions for repositories (3)
+      shell: find /home/git/repositories -type d -print0 | sudo xargs -0 chmod g+s
