@@ -139,8 +139,9 @@
     - name: Set git email
       command: chdir=/home/gitlab git config --global user.email "gitlab@localhost" # Should use same user.email as in config/gitlab.yml – is it really needed?
 
+    # TODO: If we don't use mysql, change this path.
     - name: run rake gitlab:setup
-      shell: chdir=/home/gitlab/gitlab yes yes | /usr/local/bin/bundle exec rake gitlab:setup RAILS_ENV=production
+      shell: creates=/var/lib/mysql/gitlabhq_production/users.frm chdir=/home/gitlab/gitlab yes yes | /usr/local/bin/bundle exec rake gitlab:setup RAILS_ENV=production
 
 - hosts: $target
   sudo: yes
