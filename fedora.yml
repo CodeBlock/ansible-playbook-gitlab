@@ -3,12 +3,11 @@
   sudo: yes
   tasks:
     - name: Install necessary packages
-      action: yum state=present name=$item
+      yum: state=present name=$item
       with_items:
       - httpd
       - ruby
       - rubygems
-      - rubygem-bundler
       - ruby-devel
       - git
       - python-pygments
@@ -18,12 +17,31 @@
       - libicu-devel
       - libxslt-devel
       - libxml2-devel
+      - mysql-server
+      - mysql-devel
+      - MySQL-python
+      - gcc
+      - gcc-c++
+      - glibc-devel
+
+    - name: Start services and make them start on boot
+      shell: systemctl enable $item.service && systemctl start $item.service
+      with_items:
+        - mysqld
+        - redis
+        - httpd
 
     - name: Create user 'git'
       user: state=present name=git system=yes shell=/bin/sh comment="Git Version Control"
 
     - name: Create user 'gitlab'
       user: state=present name=gitlab groups=git comment="GitLab" generate_ssh_key=yes
+      notify:
+        - Add local ssh key to known_hosts
+
+  handlers:
+    - name: Add local ssh key to known_hosts
+      shell: ssh-keyscan localhost >> /home/gitlab/.ssh/known_hosts
 
 - hosts: $target
   sudo: yes
@@ -69,10 +87,102 @@
       file: state=directory path=/home/git/.gitolite mode=750 owner=git group=git recurse=yes
 
     - name: Fix directory permissions for repositories (1)
-      command: sudo chmod -R ug+rwX,o-rwx /home/git/repositories/
+      command: chmod -R ug+rwX,o-rwx /home/git/repositories/
 
-    - name: fix directory permissions for repositories (2)
+    - name: Fix directory permissions for repositories (2)
       file: state=directory path=/home/git/repositories owner=git group=git recurse=yes
 
-    - name: fix directory permissions for repositories (3)
+    - name: Fix directory permissions for repositories (3)
       shell: find /home/git/repositories -type d -print0 | sudo xargs -0 chmod g+s
+
+    - name: Fix directory permissions for /home/git
+      shell: chmod 750 /home/git
+
+    - name: Create a MySQL db
+      mysql_db: state=present name=gitlabhq_production collation=utf8_unicode_ci encoding=utf8
+
+    - name: Add a MySQL 'gitlab' user
+      mysql_user: state=present name=gitlab host=localhost password=$database_password
+
+    - name: Grant permissions to the new MySQL 'gitlab' user
+      mysql_user: state=present name=gitlab priv=gitlabhq_production.*:SELECT,INSERT,UPDATE,DELETE,CREATE,DROP,INDEX,ALTER
+
+    - name: Install some extra necessary gems
+      command: gem install $item
+      with_items:
+        - charlock_holmes
+        - bundler
+
+- hosts: $target
+  sudo: yes
+  sudo_user: gitlab
+  tasks:
+    - name: Clone GitLab 4.2 stable
+      git: repo=https://github.com/gitlabhq/gitlabhq.git dest=/home/gitlab/gitlab version=4-2-stable
+
+    # TODO: Make this a template in case we want to tweak.
+    - name: Copy example config file into place
+      command: cp /home/gitlab/gitlab/config/gitlab.yml.example /home/gitlab/gitlab/config/gitlab.yml creates=/home/gitlab/gitlab/config/gitlab.yml
+
+    - name: Create Unicorn config
+      template: src=config/unicorn.rb dest=/home/gitlab/gitlab/config/unicorn.rb
+
+    - name: Create database config
+      template: src=config/database.yml dest=/home/gitlab/gitlab/config/database.yml
+
+    - name: Run bundler
+      command: /usr/local/bin/bundle install --deployment --without development test postgres chdir=/home/gitlab/gitlab
+
+    - name: Set git username
+      command: chdir=/home/gitlab git config --global user.name "GitLab"
+
+    - name: Set git email
+      command: chdir=/home/gitlab git config --global user.email "gitlab@localhost" # Should use same user.email as in config/gitlab.yml – is it really needed?
+
+    - name: run rake gitlab:setup
+      shell: chdir=/home/gitlab/gitlab yes yes | /usr/local/bin/bundle exec rake gitlab:setup RAILS_ENV=production
+
+- hosts: $target
+  sudo: yes
+  tasks:
+    - name: Copy post-receive hook
+      command: cp /home/gitlab/gitlab/lib/hooks/post-receive /home/git/.gitolite/hooks/common/post-receive creates=/home/git/.gitolite/hooks/common/post-receive
+
+    - name: Set permissions on post-receive hook
+      file: state=file path=/home/git/.gitolite/hooks/common/post-receive owner=git group=git
+
+    - name: Put gitlab and gitlab-worker systemd files in place
+      template: src=config/$item.service dest=/lib/systemd/system/$item.service
+      with_items:
+        - gitlab
+        - gitlab-worker
+
+    - name: Symlink systemd files into /etc
+      command: creates=/etc/systemd/system/$item.service ln -s /usr/lib/systemd/system/$item.service /etc/systemd/system/
+      with_items:
+        - gitlab
+        - gitlab-worker
+
+    - name: Tell systemd to find the new files
+      command: systemctl --system daemon-reload
+
+    - name: Start gitlab at boot
+      command: systemctl enable gitlab
+
+    - name: Start gitlab now
+      command: systemctl start gitlab.service
+
+    - name: Configure Apache
+      template: src=config/vhost.conf dest=/etc/httpd/conf.d/gitlab.conf
+
+    - name: Allow Apache to proxy to Unicorn (SELinux)
+      command: setsebool -P httpd_can_network_connect 1
+
+    - name: Restart Apache
+      command: service httpd restart
+
+    - name: Fix iptables
+      template: src=config/iptables dest=/etc/sysconfig/iptables
+
+    - name: Restart iptables
+      command: service iptables restart
